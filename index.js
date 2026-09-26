@@ -1,0 +1,865 @@
+/**
+ * ============================================================
+ *  Scraper de Beneficios - Banco Provincia de Buenos Aires
+ * ============================================================
+ *
+ *  Estrategia: "Clic Secuencial / Navegación por Categorías"
+ *
+ *  1) Entramos a la página principal de beneficios.
+ *  2) Leemos el listado de categorías dentro de #beneficios_rubros.
+ *  3) Entramos a cada categoría (una por una), extraemos los
+ *     beneficios, volvemos atrás (goBack) y repetimos con la
+ *     siguiente categoría.
+ *  4) Guardamos todo en un único array consolidado -> JSON.
+ *
+ *  Requisitos previos:
+ *    npm init -y
+ *    npm install puppeteer
+ *
+ *  Ejecución:
+ *    node index.js
+ * ============================================================
+ */
+
+const puppeteer = require('puppeteer');
+const fs = require('fs');
+const path = require('path');
+
+// -----------------------------
+// Configuración general
+// -----------------------------
+const BASE_URL = 'https://www.bancoprovincia.com.ar/mvc/beneficios';
+const BANK_HOSTNAME = 'www.bancoprovincia.com.ar'; // dominio "interno" válido
+const OUTPUT_DIR = './data';
+const OUTPUT_FILE = path.join(OUTPUT_DIR, 'beneficios_bapro.json');
+
+const NAV_TIMEOUT = 30000; // 30s para navegaciones
+const SELECTOR_TIMEOUT = 15000; // 15s para esperar selectores
+
+/**
+ * Determina si un href apunta a un dominio externo al banco.
+ * Devuelve true si el link es EXTERNO (y por lo tanto debe omitirse).
+ */
+function esLinkExterno(href) {
+  if (!href) return true; // sin href -> lo tratamos como no navegable
+
+  try {
+    const url = new URL(href, BASE_URL); // resuelve relativos contra la base
+
+    // Si el protocolo no es http/https (ej: mailto:, tel:, javascript:) lo consideramos externo/no navegable
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return true;
+
+    // Lista de fragmentos de dominios de terceros conocidos (se puede ampliar)
+    const dominiosExternosConocidos = [
+      'provincianet',
+      'provinciacompras.com.ar',
+      'visa.com',
+      'mastercard.com',
+      'provinciaseguros',
+      'grupobapro',
+    ];
+
+    const hostname = url.hostname.toLowerCase();
+
+    const coincideConocido = dominiosExternosConocidos.some((frag) =>
+      hostname.includes(frag)
+    );
+    if (coincideConocido) return true;
+
+    // Si el hostname no coincide con el dominio del banco, lo tratamos como externo
+    if (hostname !== BANK_HOSTNAME) return true;
+
+    return false;
+  } catch (err) {
+    // Si la URL no se pudo parsear, la tratamos como no navegable / externa
+    return true;
+  }
+}
+
+/**
+ * Extrae TODAS las promociones dentro de una página de categoría ya cargada.
+ *
+ * Confirmado con HTML real de dos categorías distintas:
+ *   - Gastronomía: 1 sola promoción en la página.
+ *   - Indumentaria: 4 promociones distintas apiladas en la MISMA página
+ *     (10%+4 cuotas / 12 cuotas sin interés / 6 cuotas online / Nike 12 cuotas fijas).
+ *
+ * El límite real entre una promo y la siguiente NO es <div class="dividerBenef">
+ * (eso marca campañas más grandes, ej. "Todos los viernes y sábados" vs
+ * "Todos los días", que pueden contener varias promos adentro), sino cada
+ * aparición de <h2 class="benef3"> (el rubro/alcance de esa promo puntual,
+ * ej. "En indumentaria", "En toda la tienda").
+ *
+ * Estrategia: recorremos todo el árbol de `.internal_content_area` en orden
+ * de documento con un TreeWalker, generamos una lista plana de "eventos"
+ * (h1, porcentaje, benef3, condición, local adherido, legal) y después
+ * agrupamos: cada `benef3` cierra/abre una promo nueva, absorbiendo los
+ * porcentajes vistos desde la promo anterior y las condiciones/locales que
+ * aparecen HASTA la próxima benef3.
+ *
+ * Los legales (letra chica) se recolectan a nivel de página completa (no
+ * por promo individual), porque suelen estar referenciados por números de
+ * nota al pie -> (1), (2), (3) -> compartidos entre varias promos, y
+ * separarlos 1 a 1 requeriría parsear esas referencias (no vale la pena
+ * la complejidad extra por ahora). Se adjunta el mismo bloque de legales
+ * a cada promoción de la página.
+ */
+async function extraerPromocionesDeCategoria(page, categoriaNombre) {
+  await page.waitForSelector('.internal_content_area', { timeout: SELECTOR_TIMEOUT });
+
+  const promociones = await page.evaluate((categoria) => {
+    const root = document.querySelector('.internal_content_area');
+    if (!root) return [];
+
+    // Recorremos TODOS los elementos descendientes en orden de documento,
+    // sin importar cuán anidados estén (algunas promos vienen envueltas en
+    // <div class="spacer"> extra, otras no).
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    const eventos = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.matches('h1')) {
+        eventos.push({ tipo: 'h1', texto: node.innerText.trim() });
+      } else if (node.matches('span.porcentajePromo')) {
+        eventos.push({ tipo: 'porcentaje', texto: node.innerText.trim() });
+      } else if (node.matches('h2.benef3')) {
+        eventos.push({ tipo: 'benef3', texto: node.innerText.trim() });
+      } else if (node.matches('p.spacer')) {
+        eventos.push({ tipo: 'condicion', texto: node.innerText.trim() });
+      } else if (node.matches('a.obj_editor-link-text')) {
+        eventos.push({
+          tipo: 'local',
+          nombre: node.querySelector('img')?.getAttribute('alt') || null,
+          logo: node.querySelector('img')?.src || null, // URL completa de la imagen
+          url: node.href || null,
+        });
+      } else if (node.matches('p.legales')) {
+        eventos.push({ tipo: 'legal', texto: node.innerText.trim() });
+      }
+      // Nota: <div class="dividerBenef"> NO se usa como límite de promo
+      // (ver comentario arriba), así que no generamos evento para él.
+    }
+
+    const promos = [];
+    const legales = [];
+    let promoActual = null;
+    let tituloVigente = null;
+    let porcentajesPendientes = [];
+
+    for (const ev of eventos) {
+      if (ev.tipo === 'h1') {
+        tituloVigente = ev.texto || tituloVigente; // ignoramos h1 vacíos decorativos
+      } else if (ev.tipo === 'porcentaje') {
+        if (ev.texto) porcentajesPendientes.push(ev.texto);
+      } else if (ev.tipo === 'benef3') {
+        promoActual = {
+          categoria,
+          titulo: tituloVigente,
+          rubro: ev.texto || null,
+          // dedupe: el HTML a veces anida el mismo span dos veces (mismo valor)
+          porcentaje: [...new Set(porcentajesPendientes)].join(' + ') || null,
+          condiciones: [],
+          locales_adheridos: [],
+        };
+        porcentajesPendientes = [];
+        promos.push(promoActual);
+      } else if (ev.tipo === 'condicion') {
+        if (promoActual && ev.texto) promoActual.condiciones.push(ev.texto);
+      } else if (ev.tipo === 'local') {
+        if (promoActual) {
+          promoActual.locales_adheridos.push({
+            nombre: ev.nombre,
+            logo: ev.logo,
+            url: ev.url,
+          });
+        }
+      } else if (ev.tipo === 'legal') {
+        if (ev.texto) legales.push(ev.texto);
+      }
+    }
+
+    // Fallback: si la página no tiene ningún h2.benef3 (estructura mínima o
+    // distinta a lo visto hasta ahora), igual devolvemos UNA promoción
+    // "genérica" con lo que se haya podido juntar, para no perder la
+    // categoría entera por no encajar 100% en el patrón esperado.
+    if (promos.length === 0) {
+      promos.push({
+        categoria,
+        titulo: tituloVigente,
+        rubro: null,
+        porcentaje: [...new Set(porcentajesPendientes)].join(' + ') || null,
+        condiciones: [],
+        locales_adheridos: [],
+      });
+    }
+
+    const legalesTexto = legales.join(' ') || null;
+
+    return promos.map((p) => ({
+      ...p,
+      condiciones: p.condiciones.join(' | ') || null,
+      legales: legalesTexto,
+    }));
+  }, categoriaNombre);
+
+  return promociones;
+}
+
+/**
+ * Extrae tarjetas de beneficios del patrón "CDNI" (Cuenta DNI).
+ *
+ * Confirmado con HTML real de la categoría "cdni". Cada tarjeta:
+ *
+ *   <a>
+ *     <div class="callModalCDNI BEN_filterDiv vari dest" id="beneficio_librerias-561">
+ *       <div class="tituloBeneficio">Renová tu biblioteca con esta promo</div>
+ *       <div class="BEN_CON_dias">Lunes y martes</div>
+ *       <div class="BEN_CON_content">
+ *         <img class="logo_recuadro" src="/CDN/Get/librerias_pictograma" alt="librerias_pictograma">
+ *         <div class="BEN_CON_nro">10</div>
+ *         <div class="BEN_CON_porcien">%</div>
+ *         <div class="BEN_CON_ahorro">de ahorro</div>
+ *       </div>
+ *       <div class="BEN_CON_legal">Conocé más</div>  <- NO es el legal real, es el texto del botón
+ *     </div>
+ *   </a>
+ *
+ * El legal completo NO está en esta tarjeta: se carga recién al hacer click,
+ * que abre un modal vía JS. Confirmado con HTML real del modal ABIERTO:
+ *
+ *   <div id="popup" class="modal" style="display: flex;">
+ *     <div class="modal-content" ...>
+ *       <span class="close">×</span>
+ *       <div id="popupContentTitular">...</div>
+ *       <div id="popupContent">
+ *         ...
+ *         <p class="BEN_MOD_baj">Tope de reintegro...</p>
+ *         <div class="BEN_MOD_lineas">Línea de condición 1</div>
+ *         <div class="BEN_MOD_lineas">Línea de condición 2</div>
+ *       </div>
+ *       <div id="popupContentLegal">
+ *         <p class="BEN_MOD_legal">TEXTO LEGAL COMPLETO...</p>
+ *       </div>
+ *     </div>
+ *   </div>
+ *
+ * Estrategia: primero sacamos todo lo visible sin interactuar (título,
+ * vigencia, rubro, porcentaje, id) con un solo $$eval. Después, POR CADA
+ * tarjeta, la clickeamos, esperamos a que #popup se muestre, extraemos el
+ * legal/tope/condiciones detalladas de adentro, cerramos el modal con
+ * #popup .close, y esperamos a que se oculte antes de pasar a la próxima
+ * (evita que dos modals se pisen si el cierre es animado).
+ */
+async function extraerTarjetasCDNI(page, categoriaNombre) {
+  // --- Fase 1: datos visibles sin interactuar ---
+  const beneficios = await page.$$eval(
+    '.callModalCDNI',
+    (tarjetas, categoria) => {
+      return tarjetas.map((tarjeta) => {
+        // El porcentaje viene partido en dos elementos separados (ej: "10" y "%")
+        const nro = tarjeta.querySelector('.BEN_CON_nro')?.innerText.trim() || '';
+        const signo = tarjeta.querySelector('.BEN_CON_porcien')?.innerText.trim() || '';
+        const ahorro = tarjeta.querySelector('.BEN_CON_ahorro')?.innerText.trim() || '';
+        const porcentaje = nro || signo ? `${nro}${signo}${ahorro ? ' ' + ahorro : ''}`.trim() : null;
+
+        return {
+          categoria,
+          id: tarjeta.getAttribute('id') || null,
+          titulo: tarjeta.querySelector('.tituloBeneficio')?.innerText.trim() || null,
+          vigencia: tarjeta.querySelector('.BEN_CON_dias')?.innerText.trim() || null,
+          rubro: tarjeta.querySelector('.logo_recuadro')?.getAttribute('alt') || null,
+          imagen: tarjeta.querySelector('.logo_recuadro')?.src || null,
+          porcentaje: porcentaje || null,
+          legales: null, // se completa en la Fase 2, abajo
+          tope: null,
+          condiciones_detalladas: [],
+        };
+      });
+    },
+    categoriaNombre
+  );
+
+  // --- Fase 2: abrir el modal de cada tarjeta y sacar el legal completo ---
+  const totalTarjetas = beneficios.length;
+
+  // Guardamos la URL de la categoría ANTES de empezar a clickear tarjetas.
+  // Algunas tarjetas (confirmado con una tarjeta temática de "localidades")
+  // no abren el modal normal: en cambio NAVEGAN a otra página (parece
+  // relacionado a un selector de provincia/localidad que vimos comentado
+  // en el HTML del modal). Si eso pasa, .callModalCDNI deja de existir en
+  // la página y todas las tarjetas siguientes fallan en cadena. Por eso
+  // chequeamos la URL después de cada click y, si cambió, volvemos acá
+  // antes de seguir con la próxima tarjeta.
+  const urlCategoriaCDNI = page.url();
+
+  for (let i = 0; i < totalTarjetas; i++) {
+    try {
+      // Re-buscamos las tarjetas frescas en cada vuelta (mismo criterio que
+      // usamos en el resto del script: evitar ElementHandles obsoletos).
+      const tarjetasHandles = await page.$$('.callModalCDNI');
+      const tarjetaHandle = tarjetasHandles[i];
+
+      if (!tarjetaHandle) {
+        console.warn(
+          `   ⚠️  No se encontró la tarjeta CDNI en el índice ${i} (la página pudo haber navegado a otro lado por una tarjeta anterior). Intentando recuperar la navegación...`
+        );
+        if (page.url() !== urlCategoriaCDNI) {
+          await page
+            .goto(urlCategoriaCDNI, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
+            .catch(() => {});
+        }
+        continue;
+      }
+
+      await tarjetaHandle.click();
+
+      // Esperamos a que el modal quede visible (display !== 'none').
+      await page
+        .waitForFunction(
+          () => {
+            const popup = document.querySelector('#popup');
+            return !!popup && getComputedStyle(popup).display !== 'none';
+          },
+          { timeout: 8000 }
+        )
+        .catch(() => {
+          console.warn(
+            `   ⚠️  El modal no se mostró a tiempo para la tarjeta ${i} ("${beneficios[i].titulo}"). Se omite el legal de esta tarjeta.`
+          );
+        });
+
+      // Si el click nos sacó de la página de la categoría (en vez de abrir
+      // el modal), no tiene sentido tratar de leer #popup: recuperamos la
+      // navegación y seguimos con la próxima tarjeta.
+      if (page.url() !== urlCategoriaCDNI) {
+        console.warn(
+          `   ⚠️  La tarjeta ${i} ("${beneficios[i].titulo}") navegó fuera de la categoría en vez de abrir un modal (probablemente requiere elegir una ubicación). Se omite su legal y se recupera la navegación.`
+        );
+        await page
+          .goto(urlCategoriaCDNI, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
+          .catch(() => {});
+        continue;
+      }
+
+      // Extraemos legal + tope + condiciones detalladas de adentro del modal.
+      const detalle = await page.evaluate(() => {
+        const legal = Array.from(
+          document.querySelectorAll('#popupContentLegal p.BEN_MOD_legal')
+        )
+          .map((p) => p.innerText.trim())
+          .filter(Boolean)
+          .join(' ');
+
+        const tope = document.querySelector('#popupContent .BEN_MOD_baj')?.innerText.trim() || null;
+
+        const condicionesDetalladas = Array.from(
+          document.querySelectorAll('#popupContent .BEN_MOD_lineas')
+        )
+          .map((div) => div.innerText.trim())
+          .filter(Boolean);
+
+        return { legal: legal || null, tope, condicionesDetalladas };
+      });
+
+      beneficios[i].legales = detalle.legal;
+      beneficios[i].tope = detalle.tope;
+      beneficios[i].condiciones_detalladas = detalle.condicionesDetalladas;
+
+      // Cerramos el modal antes de pasar a la próxima tarjeta.
+      await page.evaluate(() => {
+        document.querySelector('#popup .close')?.click();
+      });
+
+      // Esperamos a que se termine de ocultar (por si el cierre es animado).
+      await page
+        .waitForFunction(
+          () => {
+            const popup = document.querySelector('#popup');
+            return !popup || getComputedStyle(popup).display === 'none';
+          },
+          { timeout: 5000 }
+        )
+        .catch(() => {});
+    } catch (errorModal) {
+      // Si una tarjeta puntual falla, lo registramos y seguimos con las
+      // demás: no vale la pena perder las otras 24 por una que falló.
+      console.warn(
+        `   ⚠️  Error abriendo el modal de la tarjeta ${i} en "${categoriaNombre}": ${errorModal.message}`
+      );
+
+      // Por si el error dejó la página en otra URL (mismo caso de las
+      // tarjetas que navegan en vez de abrir un modal), recuperamos antes
+      // de que la próxima vuelta intente buscar tarjetas que ya no están.
+      if (page.url() !== urlCategoriaCDNI) {
+        await page
+          .goto(urlCategoriaCDNI, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
+          .catch(() => {});
+      }
+    }
+  }
+
+  return beneficios;
+}
+
+/**
+ * Detecta "sub-rubros" expresados como íconos <img onclick="window.location.href='...'">,
+ * un patrón distinto al de #beneficios_rubros a (con <a href>).
+ *
+ * Confirmado en la categoría "Entretenimientos" (idRubro=322): esa página
+ * NO tiene beneficios propios, es un rubro "paraguas" que agrupa 4 sub-rubros
+ * (Cine, Parques y Paseos, Recitales, Teatro), cada uno representado por un
+ * <img> con un onclick, no por un <a>:
+ *
+ *   <img src="/CDN/Get/icono_cine" onclick="window.location.href='/mvc/banca-personal/cines'" alt="cine">
+ *
+ * Devuelve un array de { nombre, url } o [] si no encuentra este patrón.
+ */
+async function extraerSubIconos(page, baseUrl) {
+  const subIconosRaw = await page.$$eval('img[onclick*="window.location.href"]', (imgs) =>
+    imgs.map((img) => ({
+      // Fallbacks en orden: alt de la imagen -> title de la imagen -> ''
+      // (si ninguno existe, más abajo derivamos el nombre de la URL misma,
+      // que siempre está disponible, en vez de dejar "sin-nombre").
+      nombre: img.getAttribute('alt') || img.getAttribute('title') || '',
+      onclick: img.getAttribute('onclick') || '',
+    }))
+  );
+
+  // Extraemos la URL de adentro del string del onclick con una regex,
+  // ya que no es un atributo href navegable directamente.
+  const regexUrl = /window\.location\.href\s*=\s*'([^']+)'/;
+
+  return subIconosRaw
+    .map(({ nombre, onclick }) => {
+      const match = onclick.match(regexUrl);
+      if (!match) return null;
+      try {
+        const urlAbsoluta = new URL(match[1], baseUrl).href;
+
+        // Si no conseguimos nombre por alt/title, lo derivamos del último
+        // segmento de la URL (ej: ".../banca-personal/cines" -> "cines").
+        // Es mejor que un genérico "sin-nombre" y siempre está disponible.
+        const nombreFinal =
+          nombre ||
+          decodeURIComponent(urlAbsoluta.replace(/\/$/, '').split('/').pop() || '') ||
+          'sin-nombre';
+
+        return { nombre: nombreFinal, url: urlAbsoluta };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Verifica si #resultados_beneficios existe en la página y si tiene
+ * contenido real (no solo espacios en blanco).
+ */
+async function tieneResultadosBeneficios(page) {
+  const contenedor = await page.$('#resultados_beneficios');
+  if (!contenedor) return false;
+
+  const texto = await page.$eval('#resultados_beneficios', (el) => el.innerText.trim());
+  return texto.length > 0;
+}
+
+/**
+ * Extrae tarjetas de comercios desde #resultados_beneficios, para las
+ * categorías donde ese contenedor sí tiene contenido cargado (a diferencia
+ * de las categorías "paraguas" sin beneficios propios, ver patrón 4).
+ *
+ * ⚠️ Sin confirmar contra HTML real con este contenedor poblado. Los
+ * selectores de abajo son un punto de partida razonable (el sitio usa
+ * clases con prefijo "w3-" del framework W3.CSS en el resto de la página),
+ * pero conviene revisar el JSON resultante con cuidado si este patrón
+ * llega a activarse en una corrida real.
+ */
+async function extraerDeResultadosBeneficios(page, categoriaNombre) {
+  const beneficios = await page.$$eval(
+    '#resultados_beneficios .w3-card, #resultados_beneficios .beneficio-item, #resultados_beneficios tr',
+    (items, categoria) => {
+      return items.map((item) => ({
+        categoria,
+        comercio: item.querySelector('.titulo, .nombre, td:nth-child(1)')?.innerText.trim() ?? null,
+        direccion: item.querySelector('.direccion, .domicilio')?.innerText.trim() ?? null,
+        descuento: item.querySelector('.descuento, .porcentaje')?.innerText.trim() ?? null,
+        condiciones: item.querySelector('.condiciones')?.innerText.trim() ?? null,
+        imagen: item.querySelector('img')?.src ?? null,
+        url: item.querySelector('a')?.href ?? null,
+      }));
+    },
+    categoriaNombre
+  );
+
+  return beneficios;
+}
+
+/**
+ * Procesa una categoría de forma RECURSIVA:
+ *   1) Si encuentra el patrón "artículo único" (.internal_content_area con h1) -> extrae y listo.
+ *   2) Si no, si #resultados_beneficios tiene contenido -> extrae de ahí.
+ *   3) Si no, busca sub-íconos (onclick) -> entra a cada uno y se llama a sí misma.
+ *   4) Si no encuentra ninguno de los 3 patrones -> lo reporta como estructura desconocida.
+ *
+ * `profundidad` evita loops infinitos por si dos categorías se referencian
+ * circularmente entre sí (no debería pasar, pero es una salvaguarda barata).
+ */
+async function procesarCategoria(
+  page,
+  categoriaNombre,
+  urlCategoria,
+  todosLosBeneficios,
+  categoriasConError,
+  profundidad = 0
+) {
+  const MAX_PROFUNDIDAD = 3;
+
+  if (profundidad > MAX_PROFUNDIDAD) {
+    console.warn(
+      `⚠️  Profundidad máxima alcanzada en "${categoriaNombre}" (${urlCategoria}). Se omite para evitar loops.`
+    );
+    return;
+  }
+
+  const sangria = '  '.repeat(profundidad);
+
+  // Si ya no estamos en esa URL (por ejemplo, es la primera llamada desde el
+  // índice principal donde ya hicimos click), no volvemos a navegar; si es
+  // una recursión hacia un sub-ícono, sí navegamos explícitamente.
+  if (page.url() !== urlCategoria) {
+    // domcontentloaded en vez de networkidle2: el sitio tiene un widget de
+    // chat en vivo que mantiene conexiones de fondo (polling/websocket), lo
+    // que puede hacer que la red nunca quede "quieta" y networkidle2 nunca
+    // se cumpla. El waitForSelector de más abajo es la señal real de que
+    // cargó el contenido que nos importa.
+    await page.goto(urlCategoria, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+  }
+
+  // Le damos un margen a que el contenido termine de renderizarse (algunas
+  // categorías navegan vía SPA/JS y el contenido puede tardar un poco más
+  // en aparecer que en una carga de página tradicional). Esperamos a que
+  // aparezca CUALQUIERA de los 4 patrones conocidos; si a los 8s no apareció
+  // ninguno, seguimos igual y lo vamos a marcar como "estructura no
+  // reconocida" más abajo (no rompe el flujo, solo evita un falso negativo
+  // por timing).
+  await page
+    .waitForSelector(
+      '.internal_content_area h1, .callModalCDNI, #resultados_beneficios, img[onclick*="window.location.href"]',
+      { timeout: 8000 }
+    )
+    .catch(() => {});
+
+  // --- Patrón 1: página de "artículo(s)" (Gastronomía = 1 promo, Indumentaria = varias) ---
+  //
+  // No alcanza con detectar un <h1> dentro de .internal_content_area: hay
+  // páginas "paraguas" sin beneficios propios (ver patrón 4 más abajo) que
+  // también tienen h1 pero ningún contenido real. Tampoco alcanza con
+  // exigir puntualmente h2.benef3, porque algunas categorías tienen
+  // contenido real (porcentaje, legales) sin ese elemento. Por eso se
+  // acepta cualquiera de las 3 señales de contenido (benef3, porcentaje o
+  // legales); solo si ninguna está presente, la categoría cae a los
+  // patrones siguientes.
+  const tieneH1 = (await page.$('.internal_content_area h1')) !== null;
+  const tieneSenialDeContenido =
+    (await page.$(
+      '.internal_content_area h2.benef3, .internal_content_area span.porcentajePromo, .internal_content_area p.legales'
+    )) !== null;
+  const esArticulo = tieneH1 && tieneSenialDeContenido;
+  if (esArticulo) {
+    const promociones = await extraerPromocionesDeCategoria(page, categoriaNombre);
+    console.log(
+      `${sangria}✅ [artículo] "${categoriaNombre}": ${promociones.length} promoción(es) extraída(s)`
+    );
+    todosLosBeneficios.push(...promociones);
+    return;
+  }
+
+  // --- Patrón 2: grilla de tarjetas CDNI (confirmado con HTML real de "cdni") ---
+  const esGrillaCDNI = (await page.$('.callModalCDNI')) !== null;
+  if (esGrillaCDNI) {
+    const beneficios = await extraerTarjetasCDNI(page, categoriaNombre);
+    console.log(
+      `${sangria}✅ [grilla CDNI] "${categoriaNombre}": ${beneficios.length} beneficios extraídos (legal completo por tarjeta, vía modal)`
+    );
+    todosLosBeneficios.push(...beneficios);
+    return;
+  }
+
+  // --- Patrón 3: listado con resultados ya cargados ---
+  const hayResultados = await tieneResultadosBeneficios(page);
+  if (hayResultados) {
+    const beneficios = await extraerDeResultadosBeneficios(page, categoriaNombre);
+    console.log(
+      `${sangria}✅ [listado] "${categoriaNombre}": ${beneficios.length} beneficios extraídos`
+    );
+    todosLosBeneficios.push(...beneficios);
+    return;
+  }
+
+  // --- Patrón 4: sin contenido propio, pero con sub-rubros (Entretenimientos) ---
+  const subIconos = await extraerSubIconos(page, urlCategoria);
+  if (subIconos.length > 0) {
+    console.log(
+      `${sangria}↳ "${categoriaNombre}" no tiene beneficios propios, tiene ${subIconos.length} sub-rubros. Entrando a cada uno...`
+    );
+
+    for (const subIcono of subIconos) {
+      try {
+        await procesarCategoria(
+          page,
+          `${categoriaNombre} > ${subIcono.nombre}`,
+          subIcono.url,
+          todosLosBeneficios,
+          categoriasConError,
+          profundidad + 1
+        );
+      } catch (errorSub) {
+        console.error(
+          `${sangria}❌ Error en sub-rubro "${subIcono.nombre}" de "${categoriaNombre}": ${errorSub.message}`
+        );
+        categoriasConError.push({
+          categoria: `${categoriaNombre} > ${subIcono.nombre}`,
+          error: errorSub.message,
+        });
+      }
+    }
+    return;
+  }
+
+  // --- Ningún patrón conocido: lo dejamos registrado para revisar a mano ---
+  console.warn(
+    `${sangria}⚠️  "${categoriaNombre}" (${urlCategoria}) no coincide con ningún patrón conocido (artículo único / listado / sub-rubros). Se omite.`
+  );
+  categoriasConError.push({
+    categoria: categoriaNombre,
+    error: 'Estructura de página no reconocida (revisar manualmente)',
+  });
+}
+
+(async () => {
+  const browser = await puppeteer.launch({
+    headless: true,
+    // args recomendados para entornos sin sandbox (CI, contenedores, etc.)
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+
+  const page = await browser.newPage();
+  page.setDefaultNavigationTimeout(NAV_TIMEOUT);
+  page.setDefaultTimeout(SELECTOR_TIMEOUT);
+
+  const todosLosBeneficios = []; // array consolidado final
+  const categoriasConError = []; // para el README / log final
+
+  try {
+    console.log('➡️  Accediendo a la página principal de beneficios...');
+    // domcontentloaded en vez de networkidle2 (ver nota más abajo sobre el
+    // widget de chat en vivo del sitio, que mantiene la red nunca del todo
+    // "quieta"). El waitForSelector de #beneficios_rubros que sigue es la
+    // señal real de que la página cargó lo que necesitamos.
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+
+    // Esperamos el contenedor principal de rubros/categorías
+    await page.waitForSelector('#beneficios_rubros', { timeout: SELECTOR_TIMEOUT });
+
+    // Primero contamos cuántas categorías hay (solo para saber el rango del bucle).
+    // Solo necesitamos la CANTIDAD acá; el href y nombre de cada una se
+    // vuelven a leer en cada vuelta del bucle (ver paso 1 más abajo), para
+    // no depender de datos que puedan haber quedado desactualizados.
+    const totalCategorias = await page.$$eval(
+      '#beneficios_rubros a',
+      (links) => links.length
+    );
+
+    console.log(`🔎 Se encontraron ${totalCategorias} categorías en total.`);
+
+    // -----------------------------------------------------
+    // Bucle principal: recorremos categoría por categoría
+    // -----------------------------------------------------
+    for (let i = 0; i < totalCategorias; i++) {
+      try {
+        // 1) Re-scaneamos los enlaces de categorías EN CADA ITERACIÓN.
+        //    Esto es clave: después de volver al índice (paso 5) el DOM se
+        //    re-renderiza y los datos de la vuelta anterior quedarían
+        //    "stale" (obsoletos) si los hubiéramos guardado de antes.
+        await page.waitForSelector('#beneficios_rubros', { timeout: SELECTOR_TIMEOUT });
+
+        const categoriasInfo = await page.$$eval('#beneficios_rubros a', (links) =>
+          links.map((a) => ({
+            href: a.href,
+            // Muchas categorías son solo un ícono sin texto ni title, por eso
+            // agregamos el alt de la imagen como fuente adicional de nombre.
+            nombre:
+              a.innerText.trim() ||
+              a.getAttribute('title') ||
+              a.querySelector('img')?.getAttribute('alt') ||
+              'sin-nombre',
+          }))
+        );
+
+        const categoriaActual = categoriasInfo[i];
+
+        if (!categoriaActual) {
+          console.warn(`⚠️  No se encontró la categoría en el índice ${i}. Se omite.`);
+          continue;
+        }
+
+        // 2) Filtramos enlaces externos ANTES de hacer clic
+        if (esLinkExterno(categoriaActual.href)) {
+          console.log(
+            `⏭️  Categoría "${categoriaActual.nombre}" es un enlace externo (${categoriaActual.href}). Se omite.`
+          );
+          continue;
+        }
+
+        console.log(
+          `➡️  [${i + 1}/${totalCategorias}] Entrando a categoría: "${categoriaActual.nombre}"`
+        );
+
+        // 3) Navegamos DIRECTO a la URL de la categoría con page.goto(),
+        //    en vez de clickear el ícono y esperar a que cambie la URL.
+        //
+        //    Por qué el cambio: como ya tenemos el href de categoriaActual
+        //    (lo leímos con $$eval más arriba), no hace falta simular un
+        //    click. El enfoque anterior (click + esperar hasta 30s a que
+        //    cambiara window.location.href) tenía dos problemas reales:
+        //      - En categorías con navegación SPA, la URL nunca cambiaba,
+        //        así que el script perdía 30 segundos por categoría antes
+        //        de rendirse (aunque el contenido igual cargaba bien).
+        //      - El ElementHandle del ícono podía quedar obsoleto si algo
+        //        en la página se re-renderizaba justo antes del click,
+        //        tirando "Node is either not clickable or not an Element"
+        //        (pasó de verdad con la categoría "Pinturerias").
+        //    Navegar directo con goto(href) evita los dos problemas de una
+        //    sola vez: no hay click que falle, y no hay que esperar a que
+        //    cambie una URL que en muchos casos ya es la misma.
+        await page.goto(categoriaActual.href, {
+          waitUntil: 'domcontentloaded',
+          timeout: NAV_TIMEOUT,
+        });
+
+        // 4) Procesamos la categoría de forma recursiva: puede resolver
+        //    directo (artículo único / listado) o encontrar sub-rubros y
+        //    entrar a cada uno de ellos (ver caso "Entretenimientos").
+        await procesarCategoria(
+          page,
+          categoriaActual.nombre,
+          categoriaActual.href,
+          todosLosBeneficios,
+          categoriasConError
+        );
+
+        // 5) Volvemos al índice de categorías para continuar el recorrido.
+        //    Usamos goto() en vez de goBack(): si procesarCategoria() recursó
+        //    por sub-rubros, hizo varios goto() internos y goBack() solo
+        //    retrocedería UN paso del historial, no todos. goto(BASE_URL) es
+        //    más confiable y siempre nos deja en un estado conocido.
+        await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+      } catch (errorCategoria) {
+        // -----------------------------------------------------
+        // Manejo de errores POR CATEGORÍA: no debe cortar todo el scraping
+        // -----------------------------------------------------
+        console.error(
+          `❌ Error procesando la categoría en el índice ${i}: ${errorCategoria.message}`
+        );
+        categoriasConError.push({ indice: i, error: errorCategoria.message });
+
+        // Recuperación de emergencia: volvemos directo a la página base en
+        // vez de goBack(), porque tras una recursión por sub-rubros el
+        // historial puede tener varios pasos intermedios (ver nota más abajo).
+        try {
+          await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+        } catch (errorGoto) {
+          console.error(
+            `   ‼️  No se pudo recuperar la navegación: ${errorGoto.message}`
+          );
+        }
+
+        // Continuamos con la siguiente categoría sin perder lo ya acumulado
+        continue;
+      }
+    }
+
+    // -----------------------------------------------------
+    // Guardado final del JSON consolidado
+    // -----------------------------------------------------
+    if (!fs.existsSync(OUTPUT_DIR)) {
+      fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    }
+
+    fs.writeFileSync(OUTPUT_FILE, JSON.stringify(todosLosBeneficios, null, 2));
+
+    console.log('\n============================================');
+    console.log(`✅ Proceso finalizado.`);
+    console.log(`   Total de beneficios guardados: ${todosLosBeneficios.length}`);
+    console.log(`   Archivo generado: ${OUTPUT_FILE}`);
+    if (categoriasConError.length > 0) {
+      console.log(
+        `   ⚠️  Categorías con error (revisar log arriba): ${categoriasConError.length}`
+      );
+    }
+    console.log('============================================\n');
+  } catch (errorGeneral) {
+    console.error('‼️  Error general e irrecuperable del script:', errorGeneral);
+  } finally {
+    await browser.close();
+  }
+})();
+
+/**
+ * ============================================================
+ *  Estructura de página por patrón, y limitaciones conocidas
+ * ============================================================
+ *
+ *  Patrón 1 - Artículo(s) de promoción (la mayoría de las categorías).
+ *  Forma general de la página:
+ *
+ *    <h1>Título / vigencia de la campaña</h1>          <- puede repetirse
+ *    <div class="dividerBenef"></div>                  <- separador visual (NO es límite de promo)
+ *    <div class="benef2"><span class="porcentajePromo">20%</span></div>
+ *    <h2 class="benef3">En [Rubro]</h2>                <- límite real entre una promo y la siguiente
+ *    <p class="spacer">Condición 1</p>
+ *    <p class="spacer">Condición 2</p>
+ *    ... íconos de locales/marcas adheridas (a.obj_editor-link-text > img) ...
+ *    (el bloque de arriba puede repetirse varias veces con nuevos benef3)
+ *    <p class="legales">Letra chica...</p>             <- compartida por todas las promos de la página
+ *
+ *  `extraerPromocionesDeCategoria` recorre `.internal_content_area` con un
+ *  TreeWalker y arma una lista de "eventos" en orden de documento; cada
+ *  `h2.benef3` cierra la promo anterior y abre una nueva, absorbiendo los
+ *  porcentajes vistos desde la promo anterior y las condiciones/locales
+ *  hasta el próximo benef3. Devuelve un array de promociones por categoría.
+ *
+ *  Limitaciones de este patrón:
+ *
+ *  1) Categorías sin porcentaje fijo (ej. "Cuotas sin interés", "Sorteos")
+ *     quedan con `porcentaje: null`.
+ *
+ *  2) Los legales se recolectan a nivel de página completa, no por promo
+ *     individual (suelen estar referenciados por notas al pie compartidas
+ *     -> (1), (2), (3) -> entre varias promos). Se adjunta el mismo bloque
+ *     de legales a cada promoción de esa página. Separarlos con precisión
+ *     por promo requeriría parsear esas referencias numéricas dentro de
+ *     cada `condiciones`/`rubro` y cruzarlas contra el texto de cada
+ *     `p.legales` (no implementado).
+ *
+ *  3) Si la categoría no tiene locales/marcas adheridas listadas,
+ *     `locales_adheridos` devuelve un array vacío.
+ *
+ *  Patrón 4 - Sub-rubros por ícono. Algunas categorías son "paraguas" sin
+ *  beneficios propios (sin h1 con contenido real dentro de
+ *  .internal_content_area) y agrupan sub-rubros representados como
+ *  <img onclick="window.location.href='...'"> en vez de <a href>. Por eso
+ *  `procesarCategoria()` es recursiva: si no encuentra ninguno de los
+ *  patrones 1-3, busca estos íconos con `extraerSubIconos()` y entra a
+ *  cada uno.
+ *
+ *  Patrón 3 - #resultados_beneficios (`extraerDeResultadosBeneficios`):
+ *  sin confirmar contra un HTML real con tarjetas cargadas. Sus selectores
+ *  (`.w3-card`, `.beneficio-item`, filas de tabla) están basados en que el
+ *  resto del sitio usa el framework W3.CSS, pero no se validaron contra
+ *  una página real de este tipo. Si el script llega a activar este patrón
+ *  en una corrida, conviene revisar el JSON resultante con cuidado antes
+ *  de confiar en esos datos.
+ * ============================================================
+ */

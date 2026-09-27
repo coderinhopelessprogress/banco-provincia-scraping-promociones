@@ -1,4 +1,4 @@
-# Scraper de beneficios - Banco Provincia de Buenos Aires
+ Scraper de beneficios - Banco Provincia de Buenos Aires
 
 Este script accede a la sección de beneficios de bancoprovincia.com.ar
 (www.bancoprovincia.com.ar/mvc/beneficios), recorre las categorías listadas
@@ -6,17 +6,17 @@ en el índice principal y extrae la información de cada promoción (vigencia,
 porcentaje/tipo de beneficio, rubro, condiciones, legales y locales/marcas
 adheridas), guardando todo en un único archivo JSON consolidado.
 
-## Requisitos
+ Requisitos
 - Node.js instalado (v16 o superior recomendado)
 - Ejecutar: `npm install puppeteer`
 - La primera vez, Puppeteer necesita descargar su propio Chrome:
   `npx puppeteer browsers install chrome`
 
-## Uso
+ Uso
 1. `node index.js`
 2. El resultado estará en `./data/beneficios_bapro.json`
 
-## Cómo funciona (resumen)
+ Cómo funciona (resumen)
 1. Entra a la página índice de beneficios y lee los links de categorías
    dentro de `#beneficios_rubros`.
 2. Filtra automáticamente los links que apuntan a dominios externos al
@@ -33,15 +33,15 @@ adheridas), guardando todo en un único archivo JSON consolidado.
    script sigue con la próxima categoría sin perder lo ya acumulado.
 6. Al final escribe todo en `./data/beneficios_bapro.json`.
 
-## Resultado de la última corrida (20/09/2026)
-- **34 categorías** encontradas en el índice principal.
-- **2 externas** (Provincia Compras, Beneficios VISA) omitidas a propósito.
-- **32 categorías internas procesadas (incluyendo sub-rubros de
-  Entretenimientos y Hogar y Deco), 0 con error.**
-- **82 beneficios/promociones guardadas** en total en el JSON final, todas
+ Resultado de la última corrida (20/09/2026)
+- 34 categorías encontradas en el índice principal.
+- 2 externas (Provincia Compras, Beneficios VISA) omitidas a propósito.
+- 32 categorías internas procesadas (incluyendo sub-rubros de
+  Entretenimientos y Hogar y Deco), 0 con error.
+- 82 beneficios/promociones guardadas en total en el JSON final, todas
   con datos reales (ya no quedan entradas "vacías").
 
-### Cambios respecto a la corrida anterior
+ Cambios respecto a la corrida anterior
 El sitio actualiza sus promociones periódicamente, así que es normal que
 las categorías varíen entre corridas sin que haya que tocar el código:
 - La campaña "SEMANA DE LA PINTURA" ya no está disponible (terminó).
@@ -50,12 +50,12 @@ las categorías varíen entre corridas sin que haya que tocar el código:
 - 0 errores en ambas corridas — el script absorbió los cambios de
   contenido sin necesitar ningún ajuste de código.
 
-## Patrones de página identificados
+ Patrones de página identificados
 El sitio no usa una sola estructura de HTML para todas las categorías; se
 identificaron 4 patrones distintos, y el script los detecta automáticamente
 en cada categoría (en este orden):
 
-1. **Artículo(s) de promoción** (la gran mayoría de las categorías, ej.
+1. Artículo(s) de promoción (la gran mayoría de las categorías, ej.
    Gastronomía, Indumentaria, Hoteles, etc.): un `.internal_content_area`
    con uno o varios bloques de promo. Cada `<h2 class="benef3">` marca el
    límite entre una promoción y la siguiente (una misma página puede tener
@@ -71,7 +71,7 @@ en cada categoría (en este orden):
    o `p.legales`. Si no encuentra ninguna, la categoría cae a los patrones
    siguientes (CDNI, resultados, sub-rubros) antes de rendirse.
 
-2. **Grilla de tarjetas CDNI** (categoría "cdni" / Cuenta DNI): tarjetas
+2. Grilla de tarjetas CDNI (categoría "cdni" / Cuenta DNI): tarjetas
    `.callModalCDNI` repetidas, cada una con título, vigencia, rubro (por el
    `alt` del logo) y porcentaje. RESUELTO: además de los datos visibles,
    el script clickea cada una de las 25 tarjetas, espera a que se abra su
@@ -86,13 +86,13 @@ en cada categoría (en este orden):
    categoría, y sigue con la próxima tarjeta sin perder las demás. Esas 2
    tarjetas puntuales quedan con `legales: null`.
 
-3. **Listado con `#resultados_beneficios`**: patrón contemplado en el
+3. Listado con `#resultados_beneficios`: patrón contemplado en el
    código (`extraerDeResultadosBeneficios`) pero NUNCA confirmado con un
    HTML real donde ese contenedor tuviera resultados cargados. No se activó
    en ninguna corrida real hasta ahora; los selectores ahí son "mejor
    esfuerzo" sin confirmar.
 
-4. **Sub-rubros por ícono** (`<img onclick="window.location.href='...'">`):
+4. Sub-rubros por ícono (`<img onclick="window.location.href='...'">`):
    confirmado y funcionando para las 2 categorías "paraguas" sin beneficios
    propios: Entretenimientos (Cine, Parques y Paseos, Recitales, Teatro) y
    Hogar y Deco (Bazar/Deco, Colchonería, Mueblerías). El script detecta
@@ -101,7 +101,7 @@ en cada categoría (en este orden):
    contenido real. El nombre de cada sub-rubro sale del `alt`/`title` de su
    ícono y, si ninguno existe, se deriva del último segmento de su URL.
 
-## Provincia Compras y Beneficios VISA
+ Provincia Compras y Beneficios VISA
 Quedan intencionalmente afuera del scraping. Provincia Compras es un sitio
 de e-commerce aparte (plataforma VTEX, dominio `baproar.vtexassets.com` /
 `provinciacompras.com.ar`), y Beneficios VISA lleva a visa.com.ar — ninguno
@@ -109,7 +109,7 @@ de los dos forma parte de la sección de "beneficios" propiamente dicha del
 banco. Ambos links se detectan y se omiten automáticamente por ser
 externos.
 
-## Pendientes / próximas mejoras (no bloqueantes para esta entrega)
+ Pendientes / próximas mejoras (no bloqueantes para esta entrega)
 1. 2 de las 25 tarjetas de CDNI (temática "localidades"/"marcas
    destacadas") no abren su modal de detalle: navegan a otra página en vez
    de mostrar el popup, probablemente porque requieren elegir una

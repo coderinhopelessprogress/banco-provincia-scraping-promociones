@@ -627,9 +627,26 @@ async function procesarCategoria(
     return;
   }
 
+  // --- Patrón 5: landing de campaña sin promociones propias ---
+  // Página con un h1 y una fila de íconos (a.obj_editor-link-text) que
+  // enlazan a otras categorías del sitio (ej. "Adelantate verano" enlaza a
+  // Automotores, Ómnibus, Hoteles y Balnearios). Esas categorías ya se
+  // recorren por separado desde el índice principal, así que no se extrae
+  // nada acá para no duplicar datos, y tampoco se cuenta como error.
+  const enlacesDeCampania = await page.$$eval(
+    '.internal_content_area a.obj_editor-link-text',
+    (links) => links.map((a) => a.href)
+  );
+  if (tieneH1 && enlacesDeCampania.length > 0) {
+    console.log(
+      `${sangria}ℹ️  [landing de campaña] "${categoriaNombre}": sin promociones propias, enlaza a ${enlacesDeCampania.length} categorías que se procesan por separado. Se omite.`
+    );
+    return;
+  }
+
   // --- Ningún patrón conocido: lo dejamos registrado para revisar a mano ---
   console.warn(
-    `${sangria}⚠️  "${categoriaNombre}" (${urlCategoria}) no coincide con ningún patrón conocido (artículo único / listado / sub-rubros). Se omite.`
+    `${sangria}⚠️  "${categoriaNombre}" (${urlCategoria}) no coincide con ningún patrón conocido (artículo / grilla CDNI / listado / sub-rubros / landing de campaña). Se omite.`
   );
   categoriasConError.push({
     categoria: categoriaNombre,
@@ -853,6 +870,12 @@ async function procesarCategoria(
  *  `procesarCategoria()` es recursiva: si no encuentra ninguno de los
  *  patrones 1-3, busca estos íconos con `extraerSubIconos()` y entra a
  *  cada uno.
+ *
+ *  Patrón 5 - Landing de campaña. Página con un h1 y una fila de íconos
+ *  (a.obj_editor-link-text) que enlazan a otras categorías, sin promociones
+ *  propias (ej. "Adelantate verano"). No se extrae nada porque las
+ *  categorías enlazadas ya se recorren desde el índice principal; se
+ *  registra como mensaje informativo y no como error.
  *
  *  Patrón 3 - #resultados_beneficios (`extraerDeResultadosBeneficios`):
  *  sin confirmar contra un HTML real con tarjetas cargadas. Sus selectores

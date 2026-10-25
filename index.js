@@ -3,14 +3,18 @@
  *  Scraper de Beneficios - Banco Provincia de Buenos Aires
  * ============================================================
  *
- *  Estrategia: "Clic Secuencial / Navegación por Categorías"
+ *  Estrategia: recorrido secuencial por categorías con navegación directa.
  *
  *  1) Entramos a la página principal de beneficios.
- *  2) Leemos el listado de categorías dentro de #beneficios_rubros.
- *  3) Entramos a cada categoría (una por una), extraemos los
- *     beneficios, volvemos atrás (goBack) y repetimos con la
+ *  2) Leemos el listado de categorías dentro de #beneficios_rubros y
+ *     descartamos los enlaces externos al banco.
+ *  3) Para cada categoría interna navegamos directo a su URL con
+ *     page.goto(), detectamos qué patrón de página es (artículo, grilla
+ *     CDNI, listado, sub-rubros o landing de campaña) y extraemos sus
+ *     beneficios.
+ *  4) Volvemos al índice con page.goto(BASE_URL) y repetimos con la
  *     siguiente categoría.
- *  4) Guardamos todo en un único array consolidado -> JSON.
+ *  5) Guardamos todo en un único array consolidado -> data/productos.json.
  *
  *  Requisitos previos:
  *    npm init -y
@@ -31,10 +35,63 @@ const path = require('path');
 const BASE_URL = 'https://www.bancoprovincia.com.ar/mvc/beneficios';
 const BANK_HOSTNAME = 'www.bancoprovincia.com.ar'; // dominio "interno" válido
 const OUTPUT_DIR = './data';
-const OUTPUT_FILE = path.join(OUTPUT_DIR, 'beneficios_bapro.json');
+const OUTPUT_FILE = path.join(OUTPUT_DIR, 'productos.json');
 
 const NAV_TIMEOUT = 30000; // 30s para navegaciones
 const SELECTOR_TIMEOUT = 15000; // 15s para esperar selectores
+
+/**
+ * Indica si un error significa que la pestaña de Puppeteer quedó
+ * inutilizable (frame desprendido, pestaña o sesión cerrada). En ese estado
+ * reintentar sobre la misma pestaña no sirve: hay que abrir una nueva.
+ */
+function esErrorDePaginaInutilizable(error) {
+  return /detached|Target closed|Session closed/i.test((error && error.message) || '');
+}
+
+/**
+ * Cierra la pestaña anterior (sin bloquearse si ya está rota) y abre una
+ * nueva con los mismos timeouts por defecto.
+ */
+async function abrirPaginaNueva(browser, paginaVieja) {
+  try {
+    await Promise.race([paginaVieja.close(), new Promise((resolve) => setTimeout(resolve, 5000))]);
+  } catch {
+    // la pestaña ya estaba cerrada o inutilizable
+  }
+  const pagina = await browser.newPage();
+  pagina.setDefaultNavigationTimeout(NAV_TIMEOUT);
+  pagina.setDefaultTimeout(SELECTOR_TIMEOUT);
+  return pagina;
+}
+
+/**
+ * Navega a una URL con reintentos. El sitio a veces responde lento y una
+ * navegación puntual puede superar el timeout; en lugar de perder la
+ * categoría completa por un fallo transitorio, se reintenta con una espera
+ * creciente entre intentos y recién después se propaga el error.
+ */
+async function navegarConReintentos(page, url, intentos = 3) {
+  let ultimoError;
+  for (let intento = 1; intento <= intentos; intento++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+      return;
+    } catch (error) {
+      ultimoError = error;
+      // Con la pestaña inutilizable, reintentar sobre ella no sirve: se
+      // propaga enseguida para que el llamador abra una pestaña nueva.
+      if (esErrorDePaginaInutilizable(error)) throw error;
+      console.warn(
+        `   ⚠️  Navegación a ${url} falló (intento ${intento}/${intentos}): ${error.message}`
+      );
+      if (intento < intentos) {
+        await new Promise((resolve) => setTimeout(resolve, 2000 * intento));
+      }
+    }
+  }
+  throw ultimoError;
+}
 
 /**
  * Determina si un href apunta a un dominio externo al banco.
@@ -283,14 +340,17 @@ async function extraerTarjetasCDNI(page, categoriaNombre) {
   const totalTarjetas = beneficios.length;
 
   // Guardamos la URL de la categoría ANTES de empezar a clickear tarjetas.
-  // Algunas tarjetas (confirmado con una tarjeta temática de "localidades")
-  // no abren el modal normal: en cambio NAVEGAN a otra página (parece
-  // relacionado a un selector de provincia/localidad que vimos comentado
-  // en el HTML del modal). Si eso pasa, .callModalCDNI deja de existir en
-  // la página y todas las tarjetas siguientes fallan en cadena. Por eso
-  // chequeamos la URL después de cada click y, si cambió, volvemos acá
+  // Algunas tarjetas (las temáticas de "localidades" y "marcas") no abren el
+  // modal normal sino que NAVEGAN a otra página (parece relacionado con un
+  // selector de provincia/localidad). Si eso pasa, .callModalCDNI deja de
+  // existir en la página y las tarjetas siguientes fallarían en cadena. Por
+  // eso se chequea la URL después de cada click y, si cambió, se vuelve acá
   // antes de seguir con la próxima tarjeta.
   const urlCategoriaCDNI = page.url();
+
+  // Margen para que terminen de cargar los scripts de la página (los
+  // handlers de click de las tarjetas se enlazan al cargar). Best-effort.
+  await page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 }).catch(() => {});
 
   for (let i = 0; i < totalTarjetas; i++) {
     try {
@@ -311,22 +371,32 @@ async function extraerTarjetasCDNI(page, categoriaNombre) {
         continue;
       }
 
-      await tarjetaHandle.click();
+      // Abrimos el modal. Si no aparece a tiempo (sitio lento, o handler de
+      // click todavía no enlazado), reintentamos el click una vez antes de
+      // rendirnos con esta tarjeta.
+      let modalVisible = false;
+      for (let intentoModal = 1; intentoModal <= 2 && !modalVisible; intentoModal++) {
+        const handleActual =
+          intentoModal === 1 ? tarjetaHandle : (await page.$$('.callModalCDNI'))[i];
+        if (!handleActual) break;
 
-      // Esperamos a que el modal quede visible (display !== 'none').
-      await page
-        .waitForFunction(
-          () => {
-            const popup = document.querySelector('#popup');
-            return !!popup && getComputedStyle(popup).display !== 'none';
-          },
-          { timeout: 8000 }
-        )
-        .catch(() => {
-          console.warn(
-            `   ⚠️  El modal no se mostró a tiempo para la tarjeta ${i} ("${beneficios[i].titulo}"). Se omite el legal de esta tarjeta.`
-          );
-        });
+        await handleActual.click();
+
+        // Esperamos a que el modal quede visible (display !== 'none').
+        modalVisible = await page
+          .waitForFunction(
+            () => {
+              const popup = document.querySelector('#popup');
+              return !!popup && getComputedStyle(popup).display !== 'none';
+            },
+            { timeout: 8000 }
+          )
+          .then(() => true)
+          .catch(() => false);
+
+        // Si el click navegó fuera de la categoría, no tiene sentido reintentar.
+        if (page.url() !== urlCategoriaCDNI) break;
+      }
 
       // Si el click nos sacó de la página de la categoría (en vez de abrir
       // el modal), no tiene sentido tratar de leer #popup: recuperamos la
@@ -335,9 +405,19 @@ async function extraerTarjetasCDNI(page, categoriaNombre) {
         console.warn(
           `   ⚠️  La tarjeta ${i} ("${beneficios[i].titulo}") navegó fuera de la categoría en vez de abrir un modal (probablemente requiere elegir una ubicación). Se omite su legal y se recupera la navegación.`
         );
-        await page
-          .goto(urlCategoriaCDNI, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
-          .catch(() => {});
+        await navegarConReintentos(page, urlCategoriaCDNI).catch(() => {});
+        continue;
+      }
+
+      // Si el modal no se mostró, no se lee #popup: podría contener el
+      // contenido de la tarjeta anterior y se le asignaría un legal ajeno.
+      if (!modalVisible) {
+        console.warn(
+          `   ⚠️  El modal no se mostró para la tarjeta ${i} ("${beneficios[i].titulo}") tras 2 intentos. Se omite el legal de esta tarjeta.`
+        );
+        await page.evaluate(() => {
+          document.querySelector('#popup .close')?.click();
+        });
         continue;
       }
 
@@ -381,8 +461,8 @@ async function extraerTarjetasCDNI(page, categoriaNombre) {
         )
         .catch(() => {});
     } catch (errorModal) {
-      // Si una tarjeta puntual falla, lo registramos y seguimos con las
-      // demás: no vale la pena perder las otras 24 por una que falló.
+      // Si una tarjeta puntual falla, se registra y se sigue con las demás
+      // para no perder el resto de la grilla.
       console.warn(
         `   ⚠️  Error abriendo el modal de la tarjeta ${i} en "${categoriaNombre}": ${errorModal.message}`
       );
@@ -496,12 +576,15 @@ async function extraerDeResultadosBeneficios(page, categoriaNombre) {
 }
 
 /**
- * Procesa una categoría de forma RECURSIVA:
- *   1) Si encuentra el patrón "artículo único" (.internal_content_area con h1) -> extrae y listo.
- *   2) Si no, si #resultados_beneficios tiene contenido -> extrae de ahí.
- *   3) Si no, busca sub-íconos (onclick) -> entra a cada uno y se llama a sí misma.
- *   4) Si no encuentra ninguno de los 3 patrones -> lo reporta como estructura desconocida.
- *
+ * Procesa una categoría de forma RECURSIVA, probando los patrones en orden:
+ *   1) Artículo(s): .internal_content_area con h1 y alguna señal de contenido
+ *      (h2.benef3, span.porcentajePromo o p.legales) -> extrae y termina.
+ *   2) Grilla CDNI (.callModalCDNI) -> extrae cada tarjeta y el legal de su modal.
+ *   3) #resultados_beneficios con contenido -> extrae de ahí.
+ *   4) Sub-íconos (onclick) -> entra a cada uno y se llama a sí misma.
+ *   5) Landing de campaña (h1 + enlaces a otras categorías) -> se registra
+ *      como informativa y no se extrae nada.
+ *   Si no coincide con ninguno, se registra como estructura desconocida.
  * `profundidad` evita loops infinitos por si dos categorías se referencian
  * circularmente entre sí (no debería pasar, pero es una salvaguarda barata).
  */
@@ -524,25 +607,22 @@ async function procesarCategoria(
 
   const sangria = '  '.repeat(profundidad);
 
-  // Si ya no estamos en esa URL (por ejemplo, es la primera llamada desde el
-  // índice principal donde ya hicimos click), no volvemos a navegar; si es
-  // una recursión hacia un sub-ícono, sí navegamos explícitamente.
+  // El bucle principal ya navegó a la URL de la categoría, así que en la
+  // primera llamada no se vuelve a navegar; en una recursión hacia un
+  // sub-ícono la URL es distinta y sí se navega explícitamente.
   if (page.url() !== urlCategoria) {
-    // domcontentloaded en vez de networkidle2: el sitio tiene un widget de
-    // chat en vivo que mantiene conexiones de fondo (polling/websocket), lo
-    // que puede hacer que la red nunca quede "quieta" y networkidle2 nunca
-    // se cumpla. El waitForSelector de más abajo es la señal real de que
-    // cargó el contenido que nos importa.
-    await page.goto(urlCategoria, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    // Se usa domcontentloaded en vez de networkidle2: el widget de chat en
+    // vivo del sitio mantiene conexiones de fondo (polling/websocket) y la
+    // red nunca queda "quieta". El waitForSelector de más abajo es la señal
+    // real de que cargó el contenido que nos importa.
+    await navegarConReintentos(page, urlCategoria);
   }
 
-  // Le damos un margen a que el contenido termine de renderizarse (algunas
-  // categorías navegan vía SPA/JS y el contenido puede tardar un poco más
-  // en aparecer que en una carga de página tradicional). Esperamos a que
-  // aparezca CUALQUIERA de los 4 patrones conocidos; si a los 8s no apareció
-  // ninguno, seguimos igual y lo vamos a marcar como "estructura no
-  // reconocida" más abajo (no rompe el flujo, solo evita un falso negativo
-  // por timing).
+  // Margen para que el contenido termine de renderizarse (algunas categorías
+  // navegan vía SPA/JS y tardan más en mostrarlo). Se espera a que aparezca
+  // CUALQUIERA de los selectores de los patrones conocidos; si a los 8s no
+  // apareció ninguno, se sigue igual y la categoría se marca más abajo como
+  // "estructura no reconocida" (evita un falso negativo por timing).
   await page
     .waitForSelector(
       '.internal_content_area h1, .callModalCDNI, #resultados_beneficios, img[onclick*="window.location.href"]',
@@ -661,7 +741,7 @@ async function procesarCategoria(
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
 
-  const page = await browser.newPage();
+  let page = await browser.newPage();
   page.setDefaultNavigationTimeout(NAV_TIMEOUT);
   page.setDefaultTimeout(SELECTOR_TIMEOUT);
 
@@ -670,19 +750,19 @@ async function procesarCategoria(
 
   try {
     console.log('➡️  Accediendo a la página principal de beneficios...');
-    // domcontentloaded en vez de networkidle2 (ver nota más abajo sobre el
-    // widget de chat en vivo del sitio, que mantiene la red nunca del todo
-    // "quieta"). El waitForSelector de #beneficios_rubros que sigue es la
-    // señal real de que la página cargó lo que necesitamos.
-    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    // Se usa domcontentloaded en vez de networkidle2: el widget de chat en
+    // vivo del sitio mantiene la red activa y networkidle2 no se cumpliría.
+    // El waitForSelector de #beneficios_rubros que sigue es la señal real de
+    // que la página cargó lo necesario.
+    await navegarConReintentos(page, BASE_URL);
 
     // Esperamos el contenedor principal de rubros/categorías
     await page.waitForSelector('#beneficios_rubros', { timeout: SELECTOR_TIMEOUT });
 
     // Primero contamos cuántas categorías hay (solo para saber el rango del bucle).
-    // Solo necesitamos la CANTIDAD acá; el href y nombre de cada una se
-    // vuelven a leer en cada vuelta del bucle (ver paso 1 más abajo), para
-    // no depender de datos que puedan haber quedado desactualizados.
+    // Solo hace falta la CANTIDAD acá; el href y el nombre de cada una se
+    // vuelven a leer en cada vuelta del bucle (paso 1), para no depender de
+    // datos que puedan haber quedado desactualizados.
     const totalCategorias = await page.$$eval(
       '#beneficios_rubros a',
       (links) => links.length
@@ -693,12 +773,18 @@ async function procesarCategoria(
     // -----------------------------------------------------
     // Bucle principal: recorremos categoría por categoría
     // -----------------------------------------------------
+    // Índice de la última categoría que se reintentó con una pestaña nueva
+    // (evita reintentar indefinidamente la misma categoría).
+    let indiceReintentadoConPaginaNueva = -1;
+
     for (let i = 0; i < totalCategorias; i++) {
+      const cantidadAntes = todosLosBeneficios.length;
+      let categoriaProcesada = false;
       try {
         // 1) Re-scaneamos los enlaces de categorías EN CADA ITERACIÓN.
-        //    Esto es clave: después de volver al índice (paso 5) el DOM se
-        //    re-renderiza y los datos de la vuelta anterior quedarían
-        //    "stale" (obsoletos) si los hubiéramos guardado de antes.
+        //    Después de volver al índice (paso 5) el DOM se vuelve a
+        //    renderizar, y los datos leídos en la vuelta anterior quedarían
+        //    obsoletos ("stale") si se hubieran guardado de antes.
         await page.waitForSelector('#beneficios_rubros', { timeout: SELECTOR_TIMEOUT });
 
         const categoriasInfo = await page.$$eval('#beneficios_rubros a', (links) =>
@@ -733,27 +819,14 @@ async function procesarCategoria(
           `➡️  [${i + 1}/${totalCategorias}] Entrando a categoría: "${categoriaActual.nombre}"`
         );
 
-        // 3) Navegamos DIRECTO a la URL de la categoría con page.goto(),
-        //    en vez de clickear el ícono y esperar a que cambie la URL.
-        //
-        //    Por qué el cambio: como ya tenemos el href de categoriaActual
-        //    (lo leímos con $$eval más arriba), no hace falta simular un
-        //    click. El enfoque anterior (click + esperar hasta 30s a que
-        //    cambiara window.location.href) tenía dos problemas reales:
-        //      - En categorías con navegación SPA, la URL nunca cambiaba,
-        //        así que el script perdía 30 segundos por categoría antes
-        //        de rendirse (aunque el contenido igual cargaba bien).
-        //      - El ElementHandle del ícono podía quedar obsoleto si algo
-        //        en la página se re-renderizaba justo antes del click,
-        //        tirando "Node is either not clickable or not an Element"
-        //        (pasó de verdad con la categoría "Pinturerias").
-        //    Navegar directo con goto(href) evita los dos problemas de una
-        //    sola vez: no hay click que falle, y no hay que esperar a que
-        //    cambie una URL que en muchos casos ya es la misma.
-        await page.goto(categoriaActual.href, {
-          waitUntil: 'domcontentloaded',
-          timeout: NAV_TIMEOUT,
-        });
+        // 3) Navegamos DIRECTO a la URL de la categoría con page.goto(), sin
+        //    clickear el ícono. El href ya se leyó del índice con $$eval, así
+        //    que no hace falta simular un click, y se evitan dos problemas:
+        //      - En categorías con navegación SPA la URL puede no cambiar, y
+        //        esperar ese cambio demoraría cada categoría hasta el timeout.
+        //      - El ElementHandle del ícono puede quedar obsoleto si la
+        //        página se vuelve a renderizar justo antes del click.
+        await navegarConReintentos(page, categoriaActual.href);
 
         // 4) Procesamos la categoría de forma recursiva: puede resolver
         //    directo (artículo único / listado) o encontrar sub-rubros y
@@ -765,14 +838,43 @@ async function procesarCategoria(
           todosLosBeneficios,
           categoriasConError
         );
+        categoriaProcesada = true;
 
         // 5) Volvemos al índice de categorías para continuar el recorrido.
-        //    Usamos goto() en vez de goBack(): si procesarCategoria() recursó
-        //    por sub-rubros, hizo varios goto() internos y goBack() solo
-        //    retrocedería UN paso del historial, no todos. goto(BASE_URL) es
-        //    más confiable y siempre nos deja en un estado conocido.
-        await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+        //    Se navega con goto(BASE_URL) y no con "atrás" del navegador:
+        //    si procesarCategoria() recursó por sub-rubros hizo varios
+        //    goto() internos, y retroceder un solo paso del historial no
+        //    alcanzaría. Así siempre queda en un estado conocido.
+        await navegarConReintentos(page, BASE_URL);
       } catch (errorCategoria) {
+        // Pestaña inutilizable (frame desprendido, etc.): se abre una nueva.
+        // Si la categoría ya se había extraído y el fallo fue al volver al
+        // índice, se sigue con la próxima; si no, se repite una sola vez
+        // descartando lo que haya alcanzado a guardar, para no duplicar.
+        if (esErrorDePaginaInutilizable(errorCategoria)) {
+          console.warn(
+            `   ⚠️  La pestaña quedó inutilizable (${errorCategoria.message}). Abriendo una pestaña nueva...`
+          );
+          page = await abrirPaginaNueva(browser, page);
+          try {
+            await navegarConReintentos(page, BASE_URL);
+          } catch (errorBase) {
+            console.error(
+              `   ‼️  No se pudo volver al índice con la pestaña nueva: ${errorBase.message}`
+            );
+          }
+
+          if (categoriaProcesada) continue;
+
+          if (indiceReintentadoConPaginaNueva !== i) {
+            indiceReintentadoConPaginaNueva = i;
+            todosLosBeneficios.length = cantidadAntes;
+            console.warn(`   ↻ Reintentando la categoría del índice ${i} con la pestaña nueva.`);
+            i--;
+            continue;
+          }
+        }
+
         // -----------------------------------------------------
         // Manejo de errores POR CATEGORÍA: no debe cortar todo el scraping
         // -----------------------------------------------------
@@ -781,11 +883,11 @@ async function procesarCategoria(
         );
         categoriasConError.push({ indice: i, error: errorCategoria.message });
 
-        // Recuperación de emergencia: volvemos directo a la página base en
-        // vez de goBack(), porque tras una recursión por sub-rubros el
-        // historial puede tener varios pasos intermedios (ver nota más abajo).
+        // Recuperación de emergencia: volvemos directo a la página base con
+        // goto(), porque tras una recursión por sub-rubros el historial del
+        // navegador tiene varios pasos intermedios y "atrás" no alcanzaría.
         try {
-          await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+          await navegarConReintentos(page, BASE_URL);
         } catch (errorGoto) {
           console.error(
             `   ‼️  No se pudo recuperar la navegación: ${errorGoto.message}`
@@ -864,12 +966,12 @@ async function procesarCategoria(
  *     `locales_adheridos` devuelve un array vacío.
  *
  *  Patrón 4 - Sub-rubros por ícono. Algunas categorías son "paraguas" sin
- *  beneficios propios (sin h1 con contenido real dentro de
- *  .internal_content_area) y agrupan sub-rubros representados como
- *  <img onclick="window.location.href='...'"> en vez de <a href>. Por eso
- *  `procesarCategoria()` es recursiva: si no encuentra ninguno de los
- *  patrones 1-3, busca estos íconos con `extraerSubIconos()` y entra a
- *  cada uno.
+ *  beneficios propios (tienen h1, pero ni h2.benef3, ni porcentaje, ni
+ *  legales dentro de .internal_content_area) y agrupan sub-rubros
+ *  representados como <img onclick="window.location.href='...'"> en vez de
+ *  <a href>. Por eso `procesarCategoria()` es recursiva: si la categoría no
+ *  coincide con los patrones 1 a 3, busca estos íconos con
+ *  `extraerSubIconos()` y entra a cada uno.
  *
  *  Patrón 5 - Landing de campaña. Página con un h1 y una fila de íconos
  *  (a.obj_editor-link-text) que enlazan a otras categorías, sin promociones

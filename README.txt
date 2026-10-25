@@ -38,7 +38,6 @@ El sitio actualiza sus promociones periódicamente, así que es normal que las c
 - Categoría que ya no aparece: “madre” (tenía 1 promoción).
 - Categorías nuevas: “icono_rubro_seven” (1 promoción) y “dexter” (1 promoción). Ambas se procesaron con el patrón 1 sin ajustes adicionales.
 - La grilla de CDNI pasó de 21 a 22 tarjetas.
-- El archivo de salida pasó a llamarse productos.json (antes beneficios_bapro.json).
 - Se reforzó la robustez del script: reintentos de navegación, recuperación ante pestaña inutilizable (ver “Cómo funciona”) y reintento del click del modal en CDNI (ver patrón 2).
 - Se actualizaron los comentarios del código para que describan únicamente el funcionamiento actual.
 

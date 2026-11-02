@@ -14,7 +14,9 @@
  *     beneficios.
  *  4) Volvemos al índice con page.goto(BASE_URL) y repetimos con la
  *     siguiente categoría.
- *  5) Guardamos todo en un único array consolidado -> data/productos.json.
+ *  5) Las categorías que fallaron por una excepción (por ejemplo, timeouts
+ *     de red) se reintentan una vez en una segunda pasada al final.
+ *  6) Guardamos todo en un único array consolidado -> data/productos.json.
  *
  *  Requisitos previos:
  *    npm init -y
@@ -91,6 +93,18 @@ async function navegarConReintentos(page, url, intentos = 3) {
     }
   }
   throw ultimoError;
+}
+
+/**
+ * Indica si el sitio respondió con su propia página de error ("Página no
+ * Disponible"). Pasa cuando el índice enlaza a una URL que ya no existe: no
+ * hay nada que extraer ni sirve reintentar.
+ */
+async function esPaginaNoDisponible(page) {
+  if (/\/mvc\/error\/notfound/i.test(page.url())) return true;
+  return page
+    .evaluate(() => /P[aá]gina no disponible/i.test(document.body?.innerText || ''))
+    .catch(() => false);
 }
 
 /**
@@ -618,6 +632,15 @@ async function procesarCategoria(
     await navegarConReintentos(page, urlCategoria);
   }
 
+  // Enlace roto del índice: el sitio muestra su página de error. Se informa
+  // y se sigue, sin esperar los selectores (que nunca van a aparecer).
+  if (await esPaginaNoDisponible(page)) {
+    console.log(
+      `${sangria}ℹ️  "${categoriaNombre}" (${urlCategoria}): el sitio responde "Página no Disponible" (enlace roto en el índice del banco). Se omite.`
+    );
+    return;
+  }
+
   // Margen para que el contenido termine de renderizarse (algunas categorías
   // navegan vía SPA/JS y tardan más en mostrarlo). Se espera a que aparezca
   // CUALQUIERA de los selectores de los patrones conocidos; si a los 8s no
@@ -700,7 +723,9 @@ async function procesarCategoria(
         );
         categoriasConError.push({
           categoria: `${categoriaNombre} > ${subIcono.nombre}`,
+          url: subIcono.url,
           error: errorSub.message,
+          reintentable: true,
         });
       }
     }
@@ -730,7 +755,9 @@ async function procesarCategoria(
   );
   categoriasConError.push({
     categoria: categoriaNombre,
+    url: urlCategoria,
     error: 'Estructura de página no reconocida (revisar manualmente)',
+    reintentable: false,
   });
 }
 
@@ -780,6 +807,7 @@ async function procesarCategoria(
     for (let i = 0; i < totalCategorias; i++) {
       const cantidadAntes = todosLosBeneficios.length;
       let categoriaProcesada = false;
+      let categoriaEnCurso = null; // { nombre, href } de la categoría que se está procesando
       try {
         // 1) Re-scaneamos los enlaces de categorías EN CADA ITERACIÓN.
         //    Después de volver al índice (paso 5) el DOM se vuelve a
@@ -814,6 +842,8 @@ async function procesarCategoria(
           );
           continue;
         }
+
+        categoriaEnCurso = categoriaActual;
 
         console.log(
           `➡️  [${i + 1}/${totalCategorias}] Entrando a categoría: "${categoriaActual.nombre}"`
@@ -881,7 +911,18 @@ async function procesarCategoria(
         console.error(
           `❌ Error procesando la categoría en el índice ${i}: ${errorCategoria.message}`
         );
-        categoriasConError.push({ indice: i, error: errorCategoria.message });
+        // Si la categoría no llegó a procesarse, se descarta lo que haya
+        // alcanzado a guardar: si la segunda pasada la recupera, se extrae
+        // completa y no se duplica. Si ya estaba procesada, el fallo fue solo
+        // al volver al índice y sus datos son válidos.
+        if (!categoriaProcesada) todosLosBeneficios.length = cantidadAntes;
+        categoriasConError.push({
+          indice: i,
+          categoria: categoriaEnCurso ? categoriaEnCurso.nombre : `índice ${i}`,
+          url: categoriaEnCurso ? categoriaEnCurso.href : null,
+          error: errorCategoria.message,
+          reintentable: Boolean(categoriaEnCurso) && !categoriaProcesada,
+        });
 
         // Recuperación de emergencia: volvemos directo a la página base con
         // goto(), porque tras una recursión por sub-rubros el historial del
@@ -900,6 +941,59 @@ async function procesarCategoria(
     }
 
     // -----------------------------------------------------
+    // Segunda pasada: reintenta UNA vez las categorías que fallaron por una
+    // excepción (por ejemplo, timeouts de red). Las de estructura no
+    // reconocida no se reintentan: volver a cargarlas no cambia el resultado.
+    // -----------------------------------------------------
+    const pendientes = categoriasConError.filter((e) => e.reintentable);
+    let recuperadas = 0;
+
+    if (pendientes.length > 0) {
+      console.log(
+        `\n🔁 Segunda pasada: reintentando ${pendientes.length} categoría(s) que fallaron.`
+      );
+
+      for (const pendiente of pendientes) {
+        const cantidadAntes = todosLosBeneficios.length;
+        const erroresDeLaPasada = [];
+        console.log(`➡️  Reintentando "${pendiente.categoria}"`);
+
+        try {
+          await navegarConReintentos(page, pendiente.url);
+          await procesarCategoria(
+            page,
+            pendiente.categoria,
+            pendiente.url,
+            todosLosBeneficios,
+            erroresDeLaPasada
+          );
+
+          // Se reemplaza el error original: si la pasada salió limpia la
+          // categoría queda recuperada; si no, quedan los errores nuevos.
+          categoriasConError.splice(categoriasConError.indexOf(pendiente), 1);
+          if (erroresDeLaPasada.length === 0) {
+            recuperadas++;
+            console.log(`   ✅ "${pendiente.categoria}" recuperada en la segunda pasada.`);
+          } else {
+            categoriasConError.push(...erroresDeLaPasada);
+          }
+        } catch (errorReintento) {
+          // Falló de nuevo: se descartan los datos parciales y se conserva
+          // el error original (ya no se reintenta).
+          todosLosBeneficios.length = cantidadAntes;
+          pendiente.reintentable = false;
+          pendiente.error = `${pendiente.error} | Segunda pasada: ${errorReintento.message}`;
+          console.error(
+            `   ❌ "${pendiente.categoria}" volvió a fallar: ${errorReintento.message}`
+          );
+          if (esErrorDePaginaInutilizable(errorReintento)) {
+            page = await abrirPaginaNueva(browser, page);
+          }
+        }
+      }
+    }
+
+    // -----------------------------------------------------
     // Guardado final del JSON consolidado
     // -----------------------------------------------------
     if (!fs.existsSync(OUTPUT_DIR)) {
@@ -912,10 +1006,16 @@ async function procesarCategoria(
     console.log(`✅ Proceso finalizado.`);
     console.log(`   Total de beneficios guardados: ${todosLosBeneficios.length}`);
     console.log(`   Archivo generado: ${OUTPUT_FILE}`);
+    if (recuperadas > 0) {
+      console.log(`   🔁 Categorías recuperadas en la segunda pasada: ${recuperadas}`);
+    }
     if (categoriasConError.length > 0) {
       console.log(
         `   ⚠️  Categorías con error (revisar log arriba): ${categoriasConError.length}`
       );
+      for (const e of categoriasConError) {
+        console.log(`      - ${e.categoria || `índice ${e.indice}`}: ${e.error}`);
+      }
     }
     console.log('============================================\n');
   } catch (errorGeneral) {

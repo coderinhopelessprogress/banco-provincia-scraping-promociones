@@ -18,28 +18,29 @@ Este script accede a la sección de beneficios de bancoprovincia.com.ar (www.ban
 4. Vuelve al índice (navegando directo a la URL base, no con "atrás" del navegador) para continuar con la próxima categoría.
 5. Toda navegación pasa por `navegarConReintentos`: hasta 3 intentos con espera creciente entre uno y otro, para no perder una categoría por un fallo transitorio (timeouts, avisos SSL, etc.).
 6. Si la pestaña queda inutilizable (error "detached Frame", pestaña o sesión cerrada), el script abre una pestaña nueva, vuelve al índice y repite esa categoría UNA sola vez, descartando lo que hubiera alcanzado a guardar de ella para no duplicar datos.
-7. Si una categoría falla igual (timeout, estructura no reconocida, etc.), el error se registra en consola y en el array `categoriasConError`, y el script sigue con la próxima categoría sin perder lo ya acumulado.
-8. Al final escribe todo en `./data/productos.json` e informa en consola el total de beneficios guardados y la cantidad de categorías con error, si las hubo.
+7. Si el sitio responde con su propia página de error (“Página no Disponible”), es decir, un enlace roto en el índice del banco, se informa en el log y se sigue con la próxima categoría. No se cuenta como error ni se reintenta.
+8. Si una categoría falla por una excepción (timeout de red, etc.), el error se registra en categoriasConError y el script sigue con la próxima sin perder lo ya acumulado. Los datos parciales de esa categoría se descartan para no duplicarlos en el reintento. Las categorías con estructura no reconocida también se registran, pero no se reintentan, porque volver a cargarlas no cambia el resultado.
+9. Segunda pasada: al terminar el recorrido, cada categoría que falló por una excepción se reintenta una sola vez. Si se recupera, se quita de los errores; si vuelve a fallar, queda registrada con ambos mensajes.
+10. Al final escribe todo en ./data/productos.json e informa en consola el total de beneficios guardados, cuántas categorías se recuperaron en la segunda pasada y el detalle de las que quedaron con error, si las hubo.
 
- Resultado de la última corrida (25/10/2026)
-- 38 categorías encontradas en el índice principal.
+ Resultado de la última corrida (02/11/2026)
+- 39 categorías encontradas en el índice principal.
 - 3 externas (Provincia Compras, Mastercard, Beneficios VISA) omitidas a propósito.
-- 35 categorías internas recorridas, 0 con error. Dos de ellas son categorías “paraguas” (Entretenimientos y Hogar y Deco), que se resolvieron entrando a sus 7 sub-rubros (4 y 3 respectivamente).
-- 80 beneficios/promociones guardadas en total en el JSON final.
-- 1 de esas categorías (“Adelantate verano”) es una landing de campaña sin promociones propias: enlaza a Automotores, Ómnibus, Hoteles y Balnearios, que ya se procesan por separado (ver patrón 5).
-- La grilla de CDNI tuvo 22 tarjetas en esta corrida (2 de ellas sin legal, ver patrón 2).
+- 36 categorías internas: 35 recorridas sin error y 1 con enlace roto en el índice del banco ("Aerolíneas Argentinas", cuya URL responde "Página no Disponible"), que se informa y se omite. 0 errores. Dos de las categorías recorridas son "paraguas" (Entretenimientos y Hogar y Deco), que se resolvieron entrando a sus 7 sub-rubros (4 y 3 respectivamente).
+- 79 beneficios/promociones guardadas en total en el JSON final.
+- 1 de esas categorías ("Adelantate verano") es una landing de campaña sin promociones propias: enlaza a Automotores, Ómnibus, Hoteles y Balnearios, que ya se procesan por separado (ver patrón 5).
+- La grilla de CDNI tuvo 21 tarjetas en esta corrida (2 de ellas sin legal, ver patrón 2).
+- No hubo categorías para reintentar en la segunda pasada.
 
-
-
-Cambios respecto a la entrega anterior (corrida del 12/10: 37 categorías, 78 beneficios)
+ Cambios respecto a la entrega anterior (corrida del 25/10: 38 categorías, 80 beneficios)
 El sitio actualiza sus promociones periódicamente, así que es normal que las categorías y los beneficios varíen entre corridas:
-
-- El índice pasó de 37 a 38 categorías, y los beneficios de 78 a 80.
-- Categoría que ya no aparece: “madre” (tenía 1 promoción).
-- Categorías nuevas: “icono_rubro_seven” (1 promoción) y “dexter” (1 promoción). Ambas se procesaron con el patrón 1 sin ajustes adicionales.
-- La grilla de CDNI pasó de 21 a 22 tarjetas.
-- Se reforzó la robustez del script: reintentos de navegación, recuperación ante pestaña inutilizable (ver “Cómo funciona”) y reintento del click del modal en CDNI (ver patrón 2).
-- Se actualizaron los comentarios del código para que describan únicamente el funcionamiento actual.
+- El índice pasó de 38 a 39 categorías, y los beneficios de 80 a 79.
+- Categoría que ya no aparece: "icono_rubro_seven" (tenía 1 promoción).
+- Categorías nuevas: "Decathlon" (1 promoción, procesada con el patrón 1 sin ajustes) y "Aerolíneas Argentinas", cuyo enlace en el índice está roto (el sitio responde "Página no Disponible"), por lo que no aporta beneficios.
+- La grilla de CDNI pasó de 22 a 21 tarjetas.
+- Se agregó una segunda pasada que reintenta una vez las categorías que fallaron por una excepción (por ejemplo, timeouts de red).
+- Se agregó la detección de enlaces rotos del índice, que se informan en el log y no se cuentan como error.
+- Al registrar un error, el resumen final lista cada categoría afectada.
 
  Patrones de página identificados
 El sitio no usa una sola estructura de HTML para todas las categorías; se identificaron 5 patrones distintos, y el script los detecta automáticamente en cada categoría, en este orden: artículo(s), grilla CDNI, listado de resultados, sub-rubros y landing de campaña.

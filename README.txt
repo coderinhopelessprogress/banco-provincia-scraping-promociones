@@ -23,17 +23,16 @@ Este script accede a la sección de beneficios de bancoprovincia.com.ar (www.ban
 9. Segunda pasada: al terminar el recorrido, cada categoría que falló por una excepción se reintenta una sola vez. Si se recupera, se quita de los errores; si vuelve a fallar, queda registrada con ambos mensajes.
 10. Al final escribe todo en ./data/productos.json e informa en consola el total de beneficios guardados, cuántas categorías se recuperaron en la segunda pasada y el detalle de las que quedaron con error, si las hubo.
 
- Resultado de la última corrida (02/11/2026)
-- 39 categorías encontradas en el índice principal.
+ Resultado de la última corrida (10/11/2026)
+- 38 categorías encontradas en el índice principal.
 - 3 externas (Provincia Compras, Mastercard, Beneficios VISA) omitidas a propósito.
-- 36 categorías internas: 35 recorridas sin error y 1 con enlace roto en el índice del banco ("Aerolíneas Argentinas", cuya URL responde "Página no Disponible"), que se informa y se omite. 0 errores. Dos de las categorías recorridas son "paraguas" (Entretenimientos y Hogar y Deco), que se resolvieron entrando a sus 7 sub-rubros (4 y 3 respectivamente).
+- 35 categorías internas recorridas, 0 con error. Dos de ellas son categorías “paraguas” (Entretenimientos y Hogar y Deco), que se resolvieron entrando a sus 7 sub-rubros (4 y 3 respectivamente).
 - 79 beneficios/promociones guardadas en total en el JSON final.
-- 1 de esas categorías ("Adelantate verano") es una landing de campaña sin promociones propias: enlaza a Automotores, Ómnibus, Hoteles y Balnearios, que ya se procesan por separado (ver patrón 5).
+1 de esas categorías (“Adelantate verano”) es una landing de campaña sin promociones propias: enlaza a Automotores, Ómnibus, Hoteles y Balnearios, que ya se procesan por separado (ver patrón 5).
 - La grilla de CDNI tuvo 21 tarjetas en esta corrida (2 de ellas sin legal, ver patrón 2).
-- No hubo categorías para reintentar en la segunda pasada.
+- No hubo categorías para reintentar en la segunda pasada ni enlaces rotos en el índice.
 
- Cambios respecto a la entrega anterior (corrida del 25/10: 38 categorías, 80 beneficios)
-El sitio actualiza sus promociones periódicamente, así que es normal que las categorías y los beneficios varíen entre corridas:
+ Cambios respecto a la entrega anterior (corrida del 02/11: 39 categorías, 79 beneficios) El sitio actualiza sus promociones periódicamente, así que es normal que las categorías y los beneficios varíen entre corridas: 
 - El índice pasó de 38 a 39 categorías, y los beneficios de 80 a 79.
 - Categoría que ya no aparece: "icono_rubro_seven" (tenía 1 promoción).
 - Categorías nuevas: "Decathlon" (1 promoción, procesada con el patrón 1 sin ajustes) y "Aerolíneas Argentinas", cuyo enlace en el índice está roto (el sitio responde "Página no Disponible"), por lo que no aporta beneficios.
